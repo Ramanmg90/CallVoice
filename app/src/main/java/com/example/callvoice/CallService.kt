@@ -9,6 +9,8 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.ServiceInfo
+import android.media.AudioAttributes
+import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import android.net.Uri
 import android.os.Build
@@ -31,6 +33,11 @@ import java.util.Locale
 
 class CallService : Service(), RecognitionListener {
 
+    companion object {
+        @Volatile var running = false
+        @Volatile var modelReady = false
+    }
+
     private val handler = Handler(Looper.getMainLooper())
     private lateinit var tts: TextToSpeech
     private var ttsReady = false
@@ -41,6 +48,9 @@ class CallService : Service(), RecognitionListener {
     private var ringing = false
     private var lastNumber: String? = null
     private var acted = false
+    private var scoOn = false
+    private var scoReceiver: BroadcastReceiver? = null
+    private var savedVoiceVol = -1
 
     private val receiver = object : BroadcastReceiver() {
         override fun onReceive(c: Context, i: Intent) {
@@ -61,6 +71,7 @@ class CallService : Service(), RecognitionListener {
                     ringing = false
                     lastNumber = null
                     stopListening()
+                    closeBluetoothAudio()
                 }
             }
         }
@@ -69,11 +80,18 @@ class CallService : Service(), RecognitionListener {
     override fun onCreate() {
         super.onCreate()
         audio = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        running = true
         startInForeground()
 
         tts = TextToSpeech(this) { status ->
             if (status == TextToSpeech.SUCCESS) {
                 tts.language = Locale.getDefault()
+                tts.setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                        .build()
+                )
                 ttsReady = true
             }
         }
@@ -89,11 +107,11 @@ class CallService : Service(), RecognitionListener {
         val chId = "callvoice"
         val nm = getSystemService(NotificationManager::class.java)
         nm.createNotificationChannel(
-            NotificationChannel(chId, "CallVoice", NotificationManager.IMPORTANCE_LOW)
+            NotificationChannel(chId, "RoboCall", NotificationManager.IMPORTANCE_LOW)
         )
         val n = Notification.Builder(this, chId)
-            .setContentTitle("CallVoice فعال است")
-            .setContentText("منتظر تماس ورودی")
+            .setContentTitle("RoboCall is active")
+            .setContentText("Waiting for incoming calls")
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
             .build()
         if (Build.VERSION.SDK_INT >= 29)
@@ -107,6 +125,7 @@ class CallService : Service(), RecognitionListener {
             val target = File(filesDir, "model")
             if (!File(target, "am").exists()) copyAsset("model", target)
             model = Model(target.absolutePath)
+            modelReady = true
         } catch (e: Exception) {
             e.printStackTrace()
         }
@@ -136,27 +155,80 @@ class CallService : Service(), RecognitionListener {
     }
 
     private fun announce() {
-        if (!ringing || !ttsReady) { startListening(); return }
-        val name = lookupName(lastNumber)
-            ?: lastNumber?.toCharArray()?.joinToString(" ")
-            ?: "unknown number"
+        if (!ringing) return
+        openBluetoothAudio {
+            if (!ringing) return@openBluetoothAudio
+            if (!ttsReady) { startListening(); return@openBluetoothAudio }
+            val name = lookupName(lastNumber)
+                ?: lastNumber?.toCharArray()?.joinToString(" ")
+                ?: "unknown number"
 
-        tts.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-            override fun onStart(id: String?) {}
-            override fun onError(id: String?) { handler.post { startListening() } }
-            override fun onDone(id: String?) { handler.post { startListening() } }
-        })
-        tts.speak("$name is calling", TextToSpeech.QUEUE_FLUSH, null, "caller")
+            tts.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                override fun onStart(id: String?) {}
+                override fun onError(id: String?) { handler.post { startListening() } }
+                override fun onDone(id: String?) { handler.post { startListening() } }
+            })
+            tts.speak("$name is calling", TextToSpeech.QUEUE_FLUSH, null, "caller")
+        }
+    }
+
+    // قبل از حرف زدن، مسیر صدا را به ایرپاد (بلوتوث SCO) می‌بریم
+    private fun openBluetoothAudio(onReady: () -> Unit) {
+        if (scoOn) { onReady(); return }
+        scoOn = true
+        try {
+            savedVoiceVol = audio.getStreamVolume(AudioManager.STREAM_VOICE_CALL)
+            audio.setStreamVolume(
+                AudioManager.STREAM_VOICE_CALL,
+                audio.getStreamMaxVolume(AudioManager.STREAM_VOICE_CALL), 0
+            )
+        } catch (_: Exception) {}
+
+        var done = false
+        val finish = { if (!done) { done = true; handler.post(onReady) } }
+
+        if (Build.VERSION.SDK_INT >= 31) {
+            val dev = audio.availableCommunicationDevices
+                .firstOrNull { it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO }
+            if (dev != null) audio.setCommunicationDevice(dev)
+            handler.postDelayed({ finish() }, 1200)
+        } else {
+            val r = object : BroadcastReceiver() {
+                override fun onReceive(c: Context, i: Intent) {
+                    val st = i.getIntExtra(AudioManager.EXTRA_SCO_AUDIO_STATE, -1)
+                    if (st == AudioManager.SCO_AUDIO_STATE_CONNECTED) finish()
+                }
+            }
+            scoReceiver = r
+            registerReceiver(r, IntentFilter(AudioManager.ACTION_SCO_AUDIO_STATE_UPDATED))
+            audio.startBluetoothSco()
+            @Suppress("DEPRECATION")
+            audio.isBluetoothScoOn = true
+            handler.postDelayed({ finish() }, 2000)
+        }
+    }
+
+    private fun closeBluetoothAudio() {
+        if (!scoOn) return
+        scoOn = false
+        try {
+            scoReceiver?.let { unregisterReceiver(it) }
+            scoReceiver = null
+            if (Build.VERSION.SDK_INT >= 31) audio.clearCommunicationDevice()
+            else {
+                audio.stopBluetoothSco()
+                @Suppress("DEPRECATION")
+                audio.isBluetoothScoOn = false
+            }
+            if (savedVoiceVol >= 0)
+                audio.setStreamVolume(AudioManager.STREAM_VOICE_CALL, savedVoiceVol, 0)
+        } catch (_: Exception) {}
     }
 
     private fun startListening() {
         val m = model
         if (!ringing || m == null || speech != null) return
         try {
-            audio.startBluetoothSco()
-            @Suppress("DEPRECATION")
-            audio.isBluetoothScoOn = true
-
             val words = Config.ANSWER_WORDS + Config.DECLINE_WORDS
             val grammar = words.joinToString(",", "[", ",\"[unk]\"]") { "\"$it\"" }
             val rec = Recognizer(m, 16000f, grammar)
@@ -170,11 +242,6 @@ class CallService : Service(), RecognitionListener {
         speech?.stop()
         speech?.shutdown()
         speech = null
-        try {
-            audio.stopBluetoothSco()
-            @Suppress("DEPRECATION")
-            audio.isBluetoothScoOn = false
-        } catch (_: Exception) {}
     }
 
     private fun handleText(text: String) {
@@ -194,7 +261,7 @@ class CallService : Service(), RecognitionListener {
                 }
             }
         } catch (e: SecurityException) { e.printStackTrace() }
-        if (acted) handler.post { stopListening() }
+        if (acted) handler.post { stopListening(); closeBluetoothAudio() }
     }
 
     // --- RecognitionListener ---
@@ -211,11 +278,14 @@ class CallService : Service(), RecognitionListener {
         handleText(JSONObject(hypothesis).optString("text"))
     }
     override fun onError(e: Exception?) { e?.printStackTrace() }
-    override fun onTimeout() { handler.post { stopListening() } }
+    override fun onTimeout() { handler.post { stopListening(); closeBluetoothAudio() } }
 
     override fun onDestroy() {
+        running = false
+        modelReady = false
         unregisterReceiver(receiver)
         stopListening()
+        closeBluetoothAudio()
         tts.shutdown()
         super.onDestroy()
     }

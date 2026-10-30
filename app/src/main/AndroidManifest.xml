@@ -14,8 +14,8 @@
 
     <application
         android:allowBackup="false"
-        android:label="CallVoice"
-        android:theme="@android:style/Theme.Material.Light">
+        android:label="RoboCall"
+        android:theme="@android:style/Theme.Material.NoActionBar">
 
         <activity android:name=".MainActivity" android:exported="true">
             <intent-filter>
