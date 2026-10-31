@@ -5,6 +5,7 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
 import android.content.BroadcastReceiver
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
@@ -19,6 +20,7 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.provider.ContactsContract
+import android.service.quicksettings.TileService
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.telecom.TelecomManager
@@ -95,6 +97,7 @@ class CallService : Service(), RecognitionListener {
         super.onCreate()
         audio = getSystemService(Context.AUDIO_SERVICE) as AudioManager
         running = true
+        refreshTile()
         gadget = GadgetClient(this)
         assistant = Assistant(this)
         gadget.start()
@@ -305,6 +308,7 @@ class CallService : Service(), RecognitionListener {
     override fun onDestroy() {
         running = false
         modelReady = false
+        refreshTile()
         unregisterReceiver(receiver)
         stopListening()
         assistant.stop()
@@ -312,6 +316,12 @@ class CallService : Service(), RecognitionListener {
         gadget.stop()
         tts.shutdown()
         super.onDestroy()
+    }
+
+    private fun refreshTile() {
+        try {
+            TileService.requestListeningState(this, ComponentName(this, RideTile::class.java))
+        } catch (_: Exception) {}
     }
 
     // ---------- کمک برای دستیار ----------

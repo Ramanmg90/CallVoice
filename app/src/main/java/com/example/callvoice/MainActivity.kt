@@ -64,24 +64,7 @@ class MainActivity : Activity() {
     private var pulsing = false
 
     private val perms: Array<String>
-        get() {
-            val l = mutableListOf(
-                Manifest.permission.READ_PHONE_STATE,
-                Manifest.permission.READ_CALL_LOG,
-                Manifest.permission.READ_CONTACTS,
-                Manifest.permission.ANSWER_PHONE_CALLS,
-                Manifest.permission.RECORD_AUDIO,
-                Manifest.permission.CALL_PHONE
-            )
-            if (Build.VERSION.SDK_INT >= 31) {
-                l += Manifest.permission.BLUETOOTH_CONNECT
-                l += Manifest.permission.BLUETOOTH_SCAN
-            } else {
-                l += Manifest.permission.ACCESS_FINE_LOCATION
-            }
-            if (Build.VERSION.SDK_INT >= 33) l += Manifest.permission.POST_NOTIFICATIONS
-            return l.toTypedArray()
-        }
+        get() = Perms.required()
 
     private val poll = object : Runnable {
         override fun run() {
@@ -273,6 +256,34 @@ class MainActivity : Activity() {
         contactsCard.addView(addBtn, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(12) })
         col.addView(contactsCard, cardParams())
 
+        if (Build.VERSION.SDK_INT >= 33) {
+            val addTile = tv("Add Ride Mode tile to Quick Settings", 14f, GREEN, true).apply {
+                gravity = Gravity.CENTER
+                setPadding(dp(16), dp(14), dp(16), dp(14))
+                background = bg(Color.TRANSPARENT, 16, strokeColor = tint(GREEN, 140), strokeDp = 1)
+                setOnClickListener {
+                    try {
+                        getSystemService(android.app.StatusBarManager::class.java)
+                            .requestAddTileService(
+                                android.content.ComponentName(this@MainActivity, RideTile::class.java),
+                                "Ride Mode",
+                                android.graphics.drawable.Icon.createWithResource(
+                                    this@MainActivity, R.drawable.ic_ride
+                                ),
+                                mainExecutor
+                            ) { }
+                    } catch (e: Exception) {
+                        Toast.makeText(
+                            this@MainActivity,
+                            "Add it manually: swipe down > pencil > drag Ride Mode",
+                            Toast.LENGTH_LONG
+                        ).show()
+                    }
+                }
+            }
+            col.addView(addTile, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(16) })
+        }
+
         // --- دکمه‌ی تنظیمات باتری ---
         val battery = tv("Battery & autostart settings", 14f, ACCENT, true).apply {
             gravity = Gravity.CENTER
@@ -287,6 +298,7 @@ class MainActivity : Activity() {
         }
         col.addView(battery, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(16) })
 
+
         col.addView(tv("Made with ♥ by Roboram", 12f, MUTED).apply {
             gravity = Gravity.CENTER
         }, LinearLayout.LayoutParams(-2, -2).apply { topMargin = dp(22) })
@@ -294,6 +306,10 @@ class MainActivity : Activity() {
         setContentView(scroll)
         rebuildContacts()
         refresh()
+
+        if (intent.getBooleanExtra("autostart", false) && hasPerms() && !CallService.running) {
+            startForegroundService(Intent(this, CallService::class.java))
+        }
     }
 
     private fun card(title: String): LinearLayout {
