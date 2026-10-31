@@ -14,6 +14,7 @@ import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import android.net.Uri
 import android.os.Build
+import android.os.Bundle
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
@@ -38,16 +39,19 @@ class CallService : Service(), RecognitionListener {
         @Volatile var modelReady = false
     }
 
-    private val handler = Handler(Looper.getMainLooper())
-    private lateinit var tts: TextToSpeech
+    internal val handler = Handler(Looper.getMainLooper())
+    internal lateinit var tts: TextToSpeech
     private var ttsReady = false
-    private var model: Model? = null
+    internal var model: Model? = null
+    internal var inCall = false
+    internal lateinit var assistant: Assistant
     private var speech: SpeechService? = null
     private lateinit var audio: AudioManager
 
     private var ringing = false
     private var lastNumber: String? = null
     private var acted = false
+    private lateinit var gadget: GadgetClient
     private var scoOn = false
     private var scoReceiver: BroadcastReceiver? = null
     private var savedVoiceVol = -1
@@ -63,6 +67,8 @@ class CallService : Service(), RecognitionListener {
                     if (!ringing) {
                         ringing = true
                         acted = false
+                        inCall = true
+                        assistant.pause()
                         // گاهی شماره با broadcast دوم میاد؛ کمی صبر می‌کنیم
                         handler.postDelayed({ announce() }, 600)
                     }
@@ -72,6 +78,14 @@ class CallService : Service(), RecognitionListener {
                     lastNumber = null
                     stopListening()
                     closeBluetoothAudio()
+                    gadget.clear()
+                    if (state == TelephonyManager.EXTRA_STATE_OFFHOOK) {
+                        inCall = true
+                        assistant.pause()
+                    } else {
+                        inCall = false
+                        handler.postDelayed({ assistant.resume() }, 1500)
+                    }
                 }
             }
         }
@@ -81,11 +95,14 @@ class CallService : Service(), RecognitionListener {
         super.onCreate()
         audio = getSystemService(Context.AUDIO_SERVICE) as AudioManager
         running = true
+        gadget = GadgetClient(this)
+        assistant = Assistant(this)
+        gadget.start()
         startInForeground()
 
         tts = TextToSpeech(this) { status ->
             if (status == TextToSpeech.SUCCESS) {
-                tts.language = Locale.getDefault()
+                tts.language = Locale.US
                 tts.setAudioAttributes(
                     AudioAttributes.Builder()
                         .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
@@ -126,6 +143,7 @@ class CallService : Service(), RecognitionListener {
             if (!File(target, "am").exists()) copyAsset("model", target)
             model = Model(target.absolutePath)
             modelReady = true
+            handler.post { if (Store.assistantOn(this)) assistant.start() }
         } catch (e: Exception) {
             e.printStackTrace()
         }
@@ -156,12 +174,15 @@ class CallService : Service(), RecognitionListener {
 
     private fun announce() {
         if (!ringing) return
+        val contact = lookupName(lastNumber)
+        gadget.showCaller(contact ?: lastNumber ?: "Unknown")
+        val spoken = contact
+            ?: lastNumber?.toCharArray()?.joinToString(" ")
+            ?: "unknown number"
         openBluetoothAudio {
             if (!ringing) return@openBluetoothAudio
             if (!ttsReady) { startListening(); return@openBluetoothAudio }
-            val name = lookupName(lastNumber)
-                ?: lastNumber?.toCharArray()?.joinToString(" ")
-                ?: "unknown number"
+            val name = spoken
 
             tts.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                 override fun onStart(id: String?) {}
@@ -208,8 +229,9 @@ class CallService : Service(), RecognitionListener {
         }
     }
 
-    private fun closeBluetoothAudio() {
+    internal fun closeBluetoothAudio(force: Boolean = false) {
         if (!scoOn) return
+        if (!force && assistant.holdsAudio) return
         scoOn = false
         try {
             scoReceiver?.let { unregisterReceiver(it) }
@@ -285,9 +307,54 @@ class CallService : Service(), RecognitionListener {
         modelReady = false
         unregisterReceiver(receiver)
         stopListening()
-        closeBluetoothAudio()
+        assistant.stop()
+        closeBluetoothAudio(true)
+        gadget.stop()
         tts.shutdown()
         super.onDestroy()
+    }
+
+    // ---------- کمک برای دستیار ----------
+    internal fun openAudio(cb: () -> Unit) { openBluetoothAudio(cb) }
+
+    internal fun reopenAudio(cb: () -> Unit) {
+        closeBluetoothAudio(true)
+        openBluetoothAudio(cb)
+    }
+
+    internal fun speak(text: String, done: () -> Unit) {
+        if (!ttsReady) { done(); return }
+        tts.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+            override fun onStart(id: String?) {}
+            override fun onError(id: String?) { handler.post { done() } }
+            override fun onDone(id: String?) { handler.post { done() } }
+        })
+        tts.speak(text, TextToSpeech.QUEUE_FLUSH, null, "assist")
+    }
+
+    internal fun stopSpeaking() {
+        try { tts.stop() } catch (_: Exception) {}
+    }
+
+    internal fun placeCall(number: String) {
+        try {
+            val tm = getSystemService(Context.TELECOM_SERVICE) as TelecomManager
+            tm.placeCall(Uri.fromParts("tel", number, null), Bundle())
+        } catch (e: SecurityException) {
+            e.printStackTrace()
+        }
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        when (intent?.action) {
+            "RESCAN" -> gadget.rescan()
+            "ASSISTANT_ON" -> if (model != null) assistant.start()
+            "ASSISTANT_OFF" -> {
+                assistant.stop()
+                closeBluetoothAudio(true)
+            }
+        }
+        return START_STICKY
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
